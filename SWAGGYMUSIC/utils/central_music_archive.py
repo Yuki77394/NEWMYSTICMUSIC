@@ -49,7 +49,8 @@ the codebase are:
 
 import asyncio
 import os
-from datetime import datetime, timezone
+import time
+import unicodedata
 from typing import Optional
 
 from config import (
@@ -150,13 +151,54 @@ def _get_init_lock() -> asyncio.Lock:
 # ---------------------------------------------------------------------------
 
 def is_archive_enabled() -> bool:
+    """Archive is enabled when:
+      - CENTRAL_MUSIC_ARCHIVE_ENABLED is true
+      - A Mongo URI is available (either CENTRAL_MONGO_DB_URI override OR
+        the shared MONGO_DB_URI via core/mongo.py)
+      - STORAGE_CHANNEL_ID is configured
+    """
     if not CENTRAL_MUSIC_ARCHIVE_ENABLED:
         return False
+    # Mongo URI: either the legacy override OR the shared MONGO_DB_URI.
+    # core/mongo.py reads MONGO_DB_URI and creates `mongodb` (Anon db).
+    # If neither is set, archive cannot function.
     if not CENTRAL_MONGO_DB_URI:
-        return False
+        try:
+            from config import MONGO_DB_URI as _SHARED_URI
+        except Exception:
+            _SHARED_URI = None
+        if not _SHARED_URI:
+            return False
     if not STORAGE_CHANNEL_ID:
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Shared-cache schema helpers (must match CHANNELSRMUSIC's music_cache.py)
+# ---------------------------------------------------------------------------
+
+def _normalize_title(title: Optional[str]) -> str:
+    """Normalize a title for the normalized_title index field.
+    Matches CHANNELSRMUSIC's _normalize_title exactly."""
+    if not title:
+        return ""
+    s = unicodedata.normalize("NFKD", title)
+    s = s.lower().strip()
+    s = " ".join(s.split())
+    return s
+
+
+def _duration_str_to_seconds(s: Optional[str]) -> int:
+    """Convert a duration string (MM:SS or HH:MM:SS) to seconds.
+    Matches CHANNELSRMUSIC's _duration_str_to_seconds exactly."""
+    if not s:
+        return 0
+    try:
+        parts = str(s).split(":")
+        return sum(int(p) * 60 ** i for i, p in enumerate(reversed(parts)))
+    except Exception:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -236,27 +278,71 @@ async def _ensure_initialized():
         _init_attempted = now
 
         try:
-            from motor.motor_asyncio import AsyncIOMotorClient
+            # ── Determine which Mongo connection to use ──
+            #
+            # SHARED CACHE (default): reuse the existing `mongodb` client
+            # from core/mongo.py. This client uses MONGO_DB_URI + the `Anon`
+            # database — the SAME connection CHANNELSRMUSIC uses. This is
+            # the canonical shared-cache path.
+            #
+            # LEGACY OVERRIDE: if CENTRAL_MONGO_DB_URI is set, create a
+            # separate Motor client for backward compatibility.
+            if CENTRAL_MONGO_DB_URI:
+                from motor.motor_asyncio import AsyncIOMotorClient
+                client = AsyncIOMotorClient(
+                    CENTRAL_MONGO_DB_URI,
+                    serverSelectionTimeoutMS=5000,
+                )
+                await client.admin.command("ping")
+                db = client[CENTRAL_MUSIC_ARCHIVE_DB]
+                coll = db[CENTRAL_MUSIC_ARCHIVE_COLL]
+            else:
+                # Shared cache: reuse core/mongo.py's `mongodb` client.
+                # This is the SAME client CHANNELSRMUSIC uses (MONGO_DB_URI
+                # → Anon database → music_cache collection).
+                from SWAGGYMUSIC.core.mongo import mongodb as _shared_mongodb
+                client = None  # no separate client to close on failure
+                coll = _shared_mongodb[CENTRAL_MUSIC_ARCHIVE_COLL]
+                # Ping via the shared client to verify connectivity.
+                try:
+                    from SWAGGYMUSIC.core.mongo import _mongo_async_ as _shared_client
+                    await _shared_client.admin.command("ping")
+                except Exception:
+                    # _mongo_async_ may not be exported; use coll.find_one
+                    # on a non-existent doc as a lightweight ping.
+                    await coll.find_one({"_id": "__archive_ping__"})
 
-            client = AsyncIOMotorClient(
-                CENTRAL_MONGO_DB_URI,
-                serverSelectionTimeoutMS=5000,
-            )
-            await client.admin.command("ping")
-
-            db = client[CENTRAL_MUSIC_ARCHIVE_DB]
-            coll = db[CENTRAL_MUSIC_ARCHIVE_COLL]
-
-            await coll.create_index(
-                [("video_id", 1), ("media_type", 1)],
-                unique=True,
-                name="uniq_video_id_media_type",
-            )
+            # ── Create indexes (must match CHANNELSRMUSIC's names) ──
+            # CHANNELSRMUSIC creates: uniq_video_media, file_unique_id,
+            # normalized_title. We create the same indexes so both bots
+            # share the exact same index structure.
+            try:
+                await coll.create_index(
+                    [("video_id", 1), ("media_type", 1)],
+                    unique=True,
+                    name="uniq_video_media",
+                )
+            except Exception:
+                pass  # index already exists
+            try:
+                await coll.create_index(
+                    [("file_unique_id", 1)],
+                    name="file_unique_id",
+                )
+            except Exception:
+                pass
+            try:
+                await coll.create_index(
+                    [("normalized_title", 1)],
+                    name="normalized_title",
+                )
+            except Exception:
+                pass
 
             _central_client = client
             _central_coll = coll
             LOGGER(__name__).info(
-                "[CENTRAL_ARCHIVE] initialized — "
+                "[CENTRAL_ARCHIVE] initialized — shared cache "
                 f"db={CENTRAL_MUSIC_ARCHIVE_DB} "
                 f"coll={CENTRAL_MUSIC_ARCHIVE_COLL}"
             )
@@ -276,7 +362,8 @@ async def _ensure_initialized():
             # failure is what matters. ``_central_client`` / ``_central_coll``
             # are NOT set (they remain None) so no stale healthy state.
             try:
-                client.close()
+                if client is not None:
+                    client.close()
             except Exception:
                 pass
             LOGGER(__name__).warning(
@@ -461,27 +548,38 @@ async def _lookup_existing(video_id: str):
 
 
 async def _insert_record(record: dict):
-    """Attempt to insert ``record``.
+    """Insert or update the shared-cache record.
+
+    Uses ``update_one(..., upsert=True)`` on the
+    ``(video_id, media_type)`` unique key — this matches CHANNELSRMUSIC's
+    ``save_cached_track()`` exactly. Duplicate uploads can never produce
+    two documents; the second upload simply overwrites the first record
+    with a fresh file_id/message_id.
 
     Returns
     -------
-    "inserted"     — insert succeeded.
-    "duplicate"    — DuplicateKeyError; another process/bot won the race.
+    "inserted"     — upsert succeeded (insert OR update).
+    "duplicate"    — (kept for API compatibility; upsert never raises
+                     DuplicateKeyError, but we preserve the return type
+                     for the worker's existing branching).
     "error"        — other failure (timeout, connection drop, uncertain
                      write). Caller must re-query to determine ground truth.
 
     On non-duplicate operation failure, the central Mongo state is
     invalidated via ``_mark_central_unhealthy()`` so that the next
     ``_ensure_initialized()`` call will attempt a fresh reconnect after
-    the cooldown. DuplicateKeyError is NOT a connection failure — it
-    means the insert reached Mongo and was rejected by the unique index,
-    so the client is still healthy.
+    the cooldown.
     """
     coll = await _ensure_initialized()
     if coll is None:
         return "error"
     try:
-        await coll.insert_one(record)
+        await coll.update_one(
+            {"video_id": str(record["video_id"]),
+             "media_type": str(record["media_type"])},
+            {"$set": record},
+            upsert=True,
+        )
         return "inserted"
     except Exception as e:
         try:
@@ -489,11 +587,10 @@ async def _insert_record(record: dict):
         except Exception:
             DuplicateKeyError = ()  # type: ignore
         if isinstance(e, DuplicateKeyError):
-            # Duplicate-key is NOT a connection failure — the insert
-            # reached Mongo and was rejected by the unique index. The
-            # client is still healthy. Do NOT invalidate.
+            # With upsert=True this should not happen, but handle it
+            # gracefully — another process/bot won the race.
             LOGGER(__name__).info(
-                f"[CENTRAL_ARCHIVE] duplicate-key on insert for "
+                f"[CENTRAL_ARCHIVE] duplicate-key on upsert for "
                 f"video_id={record.get('video_id')} — another process/bot "
                 f"won the race"
             )
@@ -566,7 +663,7 @@ async def _archive_worker(
             return
         if existing:
             LOGGER(__name__).info(
-                f"[CENTRAL_ARCHIVE] already archived video_id={video_id}"
+                f"[CENTRAL_ARCHIVE] already cached video_id={video_id}"
             )
             return
 
@@ -598,7 +695,7 @@ async def _archive_worker(
         from SWAGGYMUSIC import app
 
         LOGGER(__name__).info(
-            f"[CENTRAL_ARCHIVE] not found in Mongo, uploading video_id={video_id}"
+            f"[CENTRAL_ARCHIVE] not found in shared cache, uploading video_id={video_id}"
         )
 
         send_kwargs: dict = {
@@ -623,20 +720,42 @@ async def _archive_worker(
             f"[CENTRAL_ARCHIVE] Telegram upload success video_id={video_id}"
         )
 
+        # ── Build the shared-cache document (CHANNELSRMUSIC-compatible) ──
+        # This schema MUST match CHANNELSRMUSIC's save_cached_track document
+        # exactly so that CHANNELSRMUSIC's get_cached_track() lookup finds
+        # the record and can reuse the file_id.
         audio_obj = sent_message.audio
+        tg_duration = int(getattr(audio_obj, "duration", 0) or 0)
+        file_size = int(getattr(audio_obj, "file_size", 0) or 0)
+        file_name = getattr(audio_obj, "file_name", "") or ""
+        final_title = title or ""
+        # duration_min: if the caller passed a duration string, use it;
+        # otherwise derive from tg_duration seconds.
+        if duration and isinstance(duration, int) and duration > 0:
+            duration_min_str = f"{duration // 60}:{duration % 60:02d}"
+        else:
+            duration_min_str = f"{tg_duration // 60}:{tg_duration % 60:02d}" if tg_duration else ""
+
+        now_ts = time.time()
         record = {
-            "video_id": video_id,
+            "video_id": str(video_id),
             "media_type": "audio",
+            "title": final_title,
+            "normalized_title": _normalize_title(final_title),
+            "duration_min": duration_min_str,
+            "duration_sec": int(_duration_str_to_seconds(duration_min_str) or tg_duration or 0),
             "file_id": audio_obj.file_id,
             "file_unique_id": audio_obj.file_unique_id,
-            "channel_id": STORAGE_CHANNEL_ID,
-            "message_id": sent_message.id,
-            "title": title,
-            "duration": getattr(audio_obj, "duration", None) or duration,
-            "thumbnail": thumbnail,
+            "file_size": file_size,
+            "tg_duration": tg_duration,
+            "channel_id": int(STORAGE_CHANNEL_ID),
+            "message_id": int(sent_message.id),
+            "file_type": "audio",
+            "file_name": file_name,
+            "thumbnail": thumbnail or "",
             "source_bot": CENTRAL_ARCHIVE_SOURCE_BOT,
-            "created_at": datetime.now(timezone.utc),
-            "updated_at": datetime.now(timezone.utc),
+            "created_at": now_ts,
+            "updated_at": now_ts,
         }
 
         # 6. Insert the Mongo record. Handle all failure modes.
@@ -644,7 +763,7 @@ async def _archive_worker(
 
         if status == "inserted":
             LOGGER(__name__).info(
-                f"[CENTRAL_ARCHIVE] Mongo record saved video_id={video_id}"
+                f"[CENTRAL_ARCHIVE] shared cache record saved video_id={video_id}"
             )
             return
 
@@ -660,7 +779,7 @@ async def _archive_worker(
         # status == "error" — uncertain write (timeout, connection drop).
         # Re-query to determine ground truth.
         LOGGER(__name__).warning(
-            f"[CENTRAL_ARCHIVE] Mongo record save failed video_id={video_id} "
+            f"[CENTRAL_ARCHIVE] shared cache save failed video_id={video_id} "
             f"— re-querying to decide orphan cleanup"
         )
         existing = await _lookup_existing(video_id)

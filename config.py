@@ -39,16 +39,32 @@ SUPPORT_CHANNEL = getenv("SUPPORT_CHANNEL", "https://t.me/SpicyxNetwork")
 SUPPORT_CHAT = getenv("SUPPORT_CHAT", "https://t.me/+gXCu09qmgwA0NjA9")
 
 # ---------------------------------------------------------------------------
-# Central Music Archive (OPTIONAL — completely isolated from the existing
-# bot MongoDB). When enabled, every successfully downloaded YouTube AUDIO
-# track (MP3) is silently archived in the background to:
+# Central Music Archive — SHARED CACHE integration with CHANNELSRMUSIC.
+#
+# When enabled, every successfully downloaded YouTube AUDIO track (MP3) is
+# silently archived in the background to:
 #   1. A Telegram storage channel (STORAGE_CHANNEL_ID)
-#   2. A separate central MongoDB (CENTRAL_MONGO_DB_URI) — uses its own
-#      database (CENTRAL_MUSIC_ARCHIVE_DB, default: music_archive) so it
-#      NEVER mixes with the existing bot's collections.
-# All three values must be set for archival to be active. If any is
-# missing, the archive is silently disabled and the bot runs exactly as
-# before. Video / MP4 is NEVER archived — audio only.
+#   2. The SHARED MongoDB music cache (same as CHANNELSRMUSIC) so that
+#      CHANNELSRMUSIC can find and reuse the Telegram file_id without any
+#      changes to its own lookup logic.
+#
+# SHARED CACHE DETAILS (must match CHANNELSRMUSIC exactly):
+#   - Mongo URI:  MONGO_DB_URI  (the SAME env var CHANNELSRMUSIC uses)
+#   - Database:   Anon          (hardcoded in core/mongo.py, same as CHANNELSRMUSIC)
+#   - Collection: music_cache   (same as CHANNELSRMUSIC's music_cache_db)
+#   - Schema:     matches CHANNELSRMUSIC's save_cached_track document
+#   - Index:      uniq_video_media on (video_id, media_type) — same name
+#
+# If CENTRAL_MONGO_DB_URI is set, it overrides MONGO_DB_URI for the archive
+# connection only (legacy/backward-compat). Otherwise the archive reuses
+# the existing MONGO_DB_URI client via core/mongo.py.
+#
+# All three values must be set for archival to be active:
+#   CENTRAL_MUSIC_ARCHIVE_ENABLED=true
+#   MONGO_DB_URI (or CENTRAL_MONGO_DB_URI) configured
+#   STORAGE_CHANNEL_ID configured
+#
+# Video / MP4 is NEVER archived — audio only.
 # ---------------------------------------------------------------------------
 CENTRAL_MUSIC_ARCHIVE_ENABLED = (
     (getenv("CENTRAL_MUSIC_ARCHIVE_ENABLED", "false") or "false")
@@ -56,12 +72,14 @@ CENTRAL_MUSIC_ARCHIVE_ENABLED = (
     .lower()
     in ("true", "1", "yes", "on")
 )
+# Legacy override: if set, archive uses a SEPARATE Mongo connection.
+# If NOT set, archive reuses the existing MONGO_DB_URI client (shared cache).
 CENTRAL_MONGO_DB_URI = getenv("CENTRAL_MONGO_DB_URI") or None
-CENTRAL_MUSIC_ARCHIVE_DB = (
-    getenv("CENTRAL_MUSIC_ARCHIVE_DB", "music_archive") or "music_archive"
-)
+# Shared cache database + collection (must match CHANNELSRMUSIC).
+# Defaults: Anon.music_cache — same as CHANNELSRMUSIC.
+CENTRAL_MUSIC_ARCHIVE_DB = getenv("CENTRAL_MUSIC_ARCHIVE_DB", "Anon") or "Anon"
 CENTRAL_MUSIC_ARCHIVE_COLL = (
-    getenv("CENTRAL_MUSIC_ARCHIVE_COLL", "tracks") or "tracks"
+    getenv("CENTRAL_MUSIC_ARCHIVE_COLL", "music_cache") or "music_cache"
 )
 CENTRAL_ARCHIVE_SOURCE_BOT = (
     getenv("CENTRAL_ARCHIVE_SOURCE_BOT", "MystMusic") or "MystMusic"
