@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.env
+.venv/
+venv/
+*.session
+*.session-journal
+.playback/
+cache/
+log.txt
+downloads/
