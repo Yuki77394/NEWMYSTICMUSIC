@@ -180,6 +180,26 @@ async def skip(cli, message: Message, _, chat_id):
             )
         except:
             return await mystic.edit_text(_["call_6"])
+        # ----------------------------------------------------------
+        # Central Archive: trigger for skipped vid_ songs.
+        # The REAL MP3 has just been downloaded. Trigger the archive
+        # with the real path. Non-blocking — schedules a background
+        # task. Existing _active_uploads dedup prevents duplicates.
+        # ----------------------------------------------------------
+        if not status and file_path:
+            try:
+                from config import autoclean
+                from SWAGGYMUSIC.utils.central_music_archive import (
+                    archive_youtube_audio,
+                )
+                autoclean.append(file_path)
+                archive_youtube_audio(
+                    file_path=file_path,
+                    video_id=str(videoid),
+                    title=title,
+                )
+            except Exception:
+                pass
         try:
             image = await YouTube.thumbnail(videoid, True)
         except:

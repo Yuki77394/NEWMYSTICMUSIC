@@ -526,8 +526,7 @@ async def _archive_worker(
     caught and logged. NEVER re-raises into the caller (except
     CancelledError for clean shutdown)."""
     LOGGER(__name__).info(
-        f"[CENTRAL_ARCHIVE] worker started — video_id={video_id} "
-        f"file={file_path}"
+        f"[CENTRAL_ARCHIVE] archive started video_id={video_id}"
     )
     protected = False
     sent_message = None
@@ -544,8 +543,7 @@ async def _archive_worker(
         # 1. Validate local file.
         if not _validate_local_file(file_path):
             LOGGER(__name__).warning(
-                f"[CENTRAL_ARCHIVE] file invalid/missing at worker start: "
-                f"{file_path}"
+                f"[CENTRAL_ARCHIVE] file invalid/missing video_id={video_id}"
             )
             return
 
@@ -562,32 +560,30 @@ async def _archive_worker(
             # failed on this retry). Do NOT upload — prevents duplicate
             # uploads during Mongo outages.
             LOGGER(__name__).warning(
-                f"[CENTRAL_ARCHIVE] Mongo unavailable for "
-                f"video_id={video_id} — skipping upload to prevent "
-                f"duplicate channel uploads"
+                f"[CENTRAL_ARCHIVE] Mongo unavailable, upload skipped "
+                f"video_id={video_id}"
             )
             return
         if existing:
             LOGGER(__name__).info(
-                f"[CENTRAL_ARCHIVE] already archived "
-                f"(video_id={video_id}) — skipping upload"
+                f"[CENTRAL_ARCHIVE] already archived video_id={video_id}"
             )
             return
 
         # 2b. Re-check _central_coll (could have been set to None by a
         #     concurrent shutdown between the lookup and here).
         if _central_coll is None:
-            LOGGER(__name__).info(
-                f"[CENTRAL_ARCHIVE] central Mongo unavailable after lookup "
-                f"— skipping upload for video_id={video_id}"
+            LOGGER(__name__).warning(
+                f"[CENTRAL_ARCHIVE] Mongo unavailable, upload skipped "
+                f"video_id={video_id}"
             )
             return
 
         # 3. Re-validate after the lookup (network round-trip elapsed).
         if not _validate_local_file(file_path):
             LOGGER(__name__).warning(
-                f"[CENTRAL_ARCHIVE] file disappeared after lookup: "
-                f"{file_path}"
+                f"[CENTRAL_ARCHIVE] file disappeared after lookup "
+                f"video_id={video_id}"
             )
             return
 
@@ -600,6 +596,10 @@ async def _archive_worker(
 
         # 5. Upload to the Telegram storage channel using the MAIN bot.
         from SWAGGYMUSIC import app
+
+        LOGGER(__name__).info(
+            f"[CENTRAL_ARCHIVE] not found in Mongo, uploading video_id={video_id}"
+        )
 
         send_kwargs: dict = {
             "chat_id": STORAGE_CHANNEL_ID,
@@ -614,10 +614,14 @@ async def _archive_worker(
 
         if not (sent_message and getattr(sent_message, "audio", None)):
             LOGGER(__name__).warning(
-                f"[CENTRAL_ARCHIVE] send_audio returned no audio object "
-                f"for video_id={video_id} — treating as upload failure"
+                f"[CENTRAL_ARCHIVE] Telegram upload failed video_id={video_id} "
+                f"(send_audio returned no audio)"
             )
             return
+
+        LOGGER(__name__).info(
+            f"[CENTRAL_ARCHIVE] Telegram upload success video_id={video_id}"
+        )
 
         audio_obj = sent_message.audio
         record = {
@@ -640,8 +644,7 @@ async def _archive_worker(
 
         if status == "inserted":
             LOGGER(__name__).info(
-                f"[CENTRAL_ARCHIVE] archived video_id={video_id} "
-                f"msg_id={sent_message.id}"
+                f"[CENTRAL_ARCHIVE] Mongo record saved video_id={video_id}"
             )
             return
 
@@ -657,8 +660,8 @@ async def _archive_worker(
         # status == "error" — uncertain write (timeout, connection drop).
         # Re-query to determine ground truth.
         LOGGER(__name__).warning(
-            f"[CENTRAL_ARCHIVE] uncertain Mongo write for "
-            f"video_id={video_id} — re-querying to decide orphan cleanup"
+            f"[CENTRAL_ARCHIVE] Mongo record save failed video_id={video_id} "
+            f"— re-querying to decide orphan cleanup"
         )
         existing = await _lookup_existing(video_id)
 
@@ -669,10 +672,8 @@ async def _archive_worker(
             # uploads in this process. Cross-process safety relies on
             # the unique index.
             LOGGER(__name__).warning(
-                f"[CENTRAL_ARCHIVE] Mongo unreachable after uncertain "
-                f"write for video_id={video_id} — keeping Telegram "
-                f"upload msg_id={sent_message.id} (cannot determine "
-                f"ground truth)"
+                f"[CENTRAL_ARCHIVE] Mongo unreachable after save attempt "
+                f"video_id={video_id} — keeping Telegram upload"
             )
             return
 
@@ -681,10 +682,8 @@ async def _archive_worker(
             # definitely failed. Our Telegram upload is an orphan —
             # delete it to prevent accumulation.
             LOGGER(__name__).warning(
-                f"[CENTRAL_ARCHIVE] Mongo confirms no record after "
-                f"uncertain write for video_id={video_id} — insert "
-                f"definitely failed. Cleaning orphan upload msg_id="
-                f"{sent_message.id}"
+                f"[CENTRAL_ARCHIVE] Mongo save confirmed failed, "
+                f"cleaning orphan video_id={video_id}"
             )
             await _safe_delete_message(app, sent_message.id)
             return
@@ -695,13 +694,13 @@ async def _archive_worker(
         )
 
     except asyncio.CancelledError:
-        LOGGER(__name__).info(
-            f"[CENTRAL_ARCHIVE] worker cancelled for video_id={video_id}"
+        LOGGER(__name__).debug(
+            f"[CENTRAL_ARCHIVE] worker cancelled video_id={video_id}"
         )
         raise
     except Exception as e:
         LOGGER(__name__).warning(
-            f"[CENTRAL_ARCHIVE] worker error for video_id={video_id}: "
+            f"[CENTRAL_ARCHIVE] archive error video_id={video_id}: "
             f"{type(e).__name__}: {e}"
         )
     finally:

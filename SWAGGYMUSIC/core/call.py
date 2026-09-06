@@ -365,7 +365,7 @@ class Call(PyTgCalls):
                     pass
             return False
 
-        LOGGER(__name__).info(
+        LOGGER(__name__).debug(
             f"[AUTOPLAY] autoplay_start called for chat {chat_id} "
             f"(seed_vidid={seed_vidid}, seed_title={seed_title!r})"
         )
@@ -391,7 +391,7 @@ class Call(PyTgCalls):
             )
             return await _fail()
 
-        LOGGER(__name__).info(
+        LOGGER(__name__).debug(
             f"[AUTOPLAY] found {len(candidates)} candidates for chat {chat_id}"
         )
 
@@ -482,7 +482,7 @@ class Call(PyTgCalls):
 
             # Success!
             chosen_track = track
-            LOGGER(__name__).info(
+            LOGGER(__name__).debug(
                 f"[AUTOPLAY] candidate {i+1}/{len(candidates)} "
                 f"vidid={vidid} playing successfully"
             )
@@ -553,7 +553,7 @@ class Call(PyTgCalls):
         except Exception:
             pass
 
-        LOGGER(__name__).info(
+        LOGGER(__name__).debug(
             f"[AUTOPLAY] autoplay_start succeeded for chat {chat_id} "
             f"(vidid={track['vidid']})"
         )
@@ -577,7 +577,7 @@ class Call(PyTgCalls):
         if not popped:
             return False
         if not await is_autoplay_on(chat_id):
-            LOGGER(__name__).info(
+            LOGGER(__name__).debug(
                 f"[AUTOPLAY] autoplay is OFF for chat {chat_id} — not "
                 f"attempting autoplay_start"
             )
@@ -586,7 +586,7 @@ class Call(PyTgCalls):
         total = max_retries + 1
         for attempt in range(total):
             try:
-                LOGGER(__name__).info(
+                LOGGER(__name__).debug(
                     f"[AUTOPLAY] attempt {attempt+1}/{total} for chat {chat_id} "
                     f"(seed_vidid={popped.get('vidid')})"
                 )
@@ -598,7 +598,7 @@ class Call(PyTgCalls):
                     client=client,
                 )
                 if started:
-                    LOGGER(__name__).info(
+                    LOGGER(__name__).debug(
                         f"[AUTOPLAY] attempt {attempt+1}/{total} succeeded "
                         f"for chat {chat_id}"
                     )
@@ -613,7 +613,7 @@ class Call(PyTgCalls):
                     f"chat {chat_id}: {type(e).__name__}: {e}"
                 )
             if attempt < max_retries:
-                LOGGER(__name__).info(
+                LOGGER(__name__).debug(
                     f"[AUTOPLAY] retrying in 5s for chat {chat_id}"
                 )
                 await asyncio.sleep(5)
@@ -684,7 +684,7 @@ class Call(PyTgCalls):
             failure no longer kills the autoplay loop.
           - All branches log through LOGGER so failures are diagnosable.
         """
-        LOGGER(__name__).info(
+        LOGGER(__name__).debug(
             f"[AUTOPLAY] change_stream (track finished) for chat {chat_id}"
         )
         await delete_old_message(chat_id)
@@ -846,6 +846,46 @@ class Call(PyTgCalls):
                     if await self._try_autoplay_with_retry(chat_id, popped, client):
                         return
                 return await self._handle_queue_ended(chat_id, client)
+            # ----------------------------------------------------------
+            # Central Archive: trigger for queued vid_ songs.
+            #
+            # The song was queued as "vid_<videoid>" (placeholder) and
+            # the REAL MP3 has just been downloaded. The put_queue()
+            # trigger didn't fire because the queued file was a
+            # placeholder, not a real .mp3. We trigger the archive HERE
+            # with the real downloaded path.
+            #
+            # Non-blocking — schedules a background task. Existing
+            # _active_uploads dedup prevents duplicates if put_queue
+            # already triggered it (e.g. direct-play path).
+            #
+            # File lifecycle: we add the real path to autoclean
+            # (playback ref) and update the queue entry so song-end
+            # cleanup uses the real path. The old placeholder ref is
+            # removed. The archive worker adds its own ref (count 2),
+            # uploads, and releases (count 1). Song-end cleanup
+            # removes the last ref (count 0 → file deleted).
+            # ----------------------------------------------------------
+            if not video and file_path:
+                try:
+                    from config import autoclean
+                    from SWAGGYMUSIC.utils.central_music_archive import (
+                        archive_youtube_audio,
+                    )
+                    db[chat_id][0]["file"] = file_path
+                    autoclean.append(file_path)
+                    try:
+                        autoclean.remove(queued)
+                    except ValueError:
+                        pass
+                    archive_youtube_audio(
+                        file_path=file_path,
+                        video_id=str(videoid),
+                        title=title,
+                    )
+                except Exception:
+                    pass
+
             stream = self._build_stream(file_path, video=video)
             try:
                 await self._play_on_assistant(client, chat_id, stream)
