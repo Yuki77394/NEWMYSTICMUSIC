@@ -192,7 +192,12 @@ async def skip(cli, message: Message, _, chat_id):
                 from SWAGGYMUSIC.utils.central_music_archive import (
                     archive_youtube_audio,
                 )
+                db[chat_id][0]["file"] = file_path
                 autoclean.append(file_path)
+                try:
+                    autoclean.remove(queued)
+                except ValueError:
+                    pass
                 archive_youtube_audio(
                     file_path=file_path,
                     video_id=str(videoid),
