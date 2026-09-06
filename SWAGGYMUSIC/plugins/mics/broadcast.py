@@ -64,11 +64,10 @@ async def braodcast_message(client, message, _):
         for i in chats:
             try:
                 m = (
-                    await app.copy_message(
+                    await app.forward_message(
                         chat_id=i,
                         from_chat_id=y,
                         message_id=x,
-                        reply_markup=reply_markup
                     )
                     if message.reply_to_message
                     else await app.send_message(i, text=query)
@@ -107,7 +106,7 @@ async def braodcast_message(client, message, _):
 
         for i in users:
             try:
-                await app.copy_message(
+                await app.forward_message(
                     chat_id=i,
                     from_chat_id=y,
                     message_id=x
@@ -137,7 +136,7 @@ async def braodcast_message(client, message, _):
             async for dialog in client.get_dialogs():
                 try:
                     if message.reply_to_message:
-                        await client.copy_message(
+                        await client.forward_message(
                             chat_id=dialog.chat.id,
                             from_chat_id=y,
                             message_id=x
